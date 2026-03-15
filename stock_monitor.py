@@ -1,283 +1,178 @@
 import warnings
 warnings.filterwarnings("ignore")
-
-import requests
-import os
-import datetime
-import time
-import json
-import re
+import requests, os, datetime, time, json, re
 from urllib.parse import quote
+import pandas as pd
+import akshare as ak
+from datetime import timezone, timedelta
+
+# --- 基础配置与时区处理 ---
+def get_beijing_time():
+    return datetime.datetime.now(timezone(timedelta(hours=8)))
 
 def get_current_time():
-    utc_now = datetime.datetime.utcnow()
-    beijing_now = utc_now + datetime.timedelta(hours=8)
-    return beijing_now.strftime("%Y-%m-%d %H:%M:%S")
+    return get_beijing_time().strftime("%Y-%m-%d %H:%M:%S")
 
-def get_stock_data(stock_code):
-    url = f"http://qt.gtimg.cn/q={stock_code}"
+def analyze_stock_strategies(symbol, stock_name):
+    """
+    量化策略引擎：扫描个股是否符合战法
+    """
+    bj_now = get_beijing_time()
+    start_date = (bj_now - datetime.timedelta(days=60)).strftime("%Y%m%d")
     try:
-        response = requests.get(url, timeout=10)
-        response.encoding = 'gbk'
-        data_str = response.text
-        if "=" not in data_str or len(data_str.split('~')) < 33:
-            return None
-        info_list = data_str.split('"')[1].split('~')
-        return {
-            "name": info_list[1],
-            "code": info_list[2],
-            "current_price": info_list[3],
-            "change_percent": info_list[32]
-        }
-    except Exception as e:
-        print(f"❌ 获取股票数据失败 [{stock_code}]: {e}")
-        return None
+        # 获取 K 线数据
+        df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start_date, adjust="qfq")
+        if df is None or len(df) < 30: return False, "", {}
+        
+        current_price = df['收盘'].iloc[-1]
+        change_pct = df['涨跌幅'].iloc[-1]
 
-# ── 新闻方案 ─────────────────────────────────────────────────────────────
-def fetch_news_from_tencent_rss(stock_name):
-    keyword = quote(stock_name)
-    url = f"https://finance.qq.com/hqdata/search?pn=1&rn=5&query={keyword}"
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; StockBot/1.0)"}
-    try:
-        r = requests.get(url, headers=headers, timeout=8)
-        r.encoding = 'utf-8'
-        data = r.json()
-        items = data.get("data", {}).get("list", [])
-        if not items: return None, None
-        news_list, titles_display = [], []
-        for item in items[:2]: # 取前2条保持卡片紧凑
-            title = item.get("title", "")
-            summary = item.get("summary", item.get("abstract", ""))
-            link = item.get("url", "")
-            if title:
-                news_list.append(f"标题：{title}\n摘要：{summary}")
-                titles_display.append(f"> - [{title}]({link})" if link else f"> - {title}")
-        if news_list: return "\n".join(news_list), "\n".join(titles_display)
-    except Exception as e:
-        pass
-    return None, None
+        # --- 策略 A: 右侧多头突破 ---
+        # 均线
+        df['MA5'] = df['收盘'].rolling(window=5).mean()
+        df['MA10'] = df['收盘'].rolling(window=10).mean()
+        # MACD 计算
+        exp1 = df['收盘'].ewm(span=12, adjust=False).mean()
+        exp2 = df['收盘'].ewm(span=26, adjust=False).mean()
+        df['MACD_DIF'] = exp1 - exp2
+        df['MACD_DEA'] = df['MACD_DIF'].ewm(span=9, adjust=False).mean()
+        
+        cond_ma = (df['MA5'].iloc[-1] > df['MA10'].iloc[-1]) and (df['MA5'].iloc[-1] > df['MA5'].iloc[-2])
+        cond_macd = (df['MACD_DIF'].iloc[-1] > df['MACD_DEA'].iloc[-1]) and (df['MACD_DIF'].iloc[-2] <= df['MACD_DEA'].iloc[-2])
+        cond_turnover = df['换手率'].iloc[-1] >= 3.5 # 换手率门槛
 
-def fetch_news_from_sina_rss(stock_name):
-    keyword = quote(stock_name)
-    url = f"https://search.sina.com.cn/news/search?key={keyword}&range=title&channel=finance&num=3&format=json"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        r = requests.get(url, headers=headers, timeout=8)
-        r.encoding = 'utf-8'
-        data = r.json()
-        items = data.get("result", {}).get("list", [])
-        if not items: return None, None
-        news_list, titles_display = [], []
-        for item in items[:2]:
-            title = re.sub(r'<[^>]+>', '', item.get("headline", ""))
-            intro = re.sub(r'<[^>]+>', '', item.get("intro", ""))
-            link = item.get("url", "")
-            if title:
-                news_list.append(f"标题：{title}\n摘要：{intro}")
-                titles_display.append(f"> - [{title}]({link})" if link else f"> - {title}")
-        if news_list: return "\n".join(news_list), "\n".join(titles_display)
-    except:
-        pass
-    return None, None
-
-def get_latest_news(stock_name):
-    sources = [
-        ("腾讯财经", fetch_news_from_tencent_rss),
-        ("新浪财经", fetch_news_from_sina_rss)
-    ]
-    for name, fn in sources:
-        news_full, titles_display = fn(stock_name)
-        if news_full: return news_full, titles_display
-        time.sleep(0.5)
-    return "近期暂无重大新闻。", "> - 暂无资讯"
-
-# ── AI 分析：支持多模型路由 ─────────────────────────────────────────────────
-FREE_MODELS = [
-    "openrouter/free", 
-    "google/gemini-2.0-flash-exp:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "deepseek/deepseek-chat-v3-0324:free"
-]
-MAX_RETRIES = 3
-RETRY_DELAY = 8
-
-def call_openrouter(api_key, model, prompt, timeout=60):
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.4, # 稍微提高一点温度，让点评更灵动
-    }
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-        if r.status_code == 200:
-            return r.json()['choices'][0]['message']['content'], None
-        return None, f"HTTP {r.status_code}"
-    except Exception as e:
-        return None, str(e)
-
-def get_batch_ai_analysis(all_sectors_context, api_key):
-    # 【核心微调：针对 20% 涨跌幅和高科技情绪的专属 Prompt】
-    prompt = f"""你是专业的硬核科技金融分析师。请结合以下按【板块】分类的成分股盘面数据和最新资讯，为每个板块写一段150字左右的深度点评。
-
-【特别关注指令】
-1. 这些标的（创业板30开头、科创板688开头）具有 **20%的单日涨跌幅限制**，请在点评中体现对其高波动性、资金博弈或溢价情绪的观察。
-2. 重点挖掘“高科技板块情绪”（如光刻机自主可控、射频芯片国产替代等）与盘面资金共振的情况。
-3. 归纳该板块是普涨/普跌，还是内部分化，并指出突发新闻对整个产业链逻辑有何潜在影响。
-
-【极其重要的格式指令】
-你必须且只能返回一个合法的 JSON 对象，绝对不要包含任何 Markdown 标记（如 ```json），不要解释，不要前缀！
-返回格式示例：
-{{
-    "光刻机与核心设备": "今日光刻机板块受外围限制传闻影响，资金博弈激烈。在20%涨跌幅限制下，中微公司等核心标的呈现...",
-    "无线电与射频通信": "无线电板块整体走势平稳，国产替代情绪带动下..."
-}}
-
-【今日板块数据与新闻】
-{all_sectors_context}
-"""
-
-    for model in FREE_MODELS:
-        for attempt in range(1, MAX_RETRIES + 1):
-            print(f"🧠 尝试模型 [{model}]，第 {attempt} 次...")
-            content, err = call_openrouter(api_key, model, prompt)
-
-            if err:
-                if "429" in err or "rate" in err.lower():
-                    time.sleep(RETRY_DELAY)
-                    continue
+        # --- 策略 B: 左侧连续超跌 ---
+        down_days = 0
+        for i in range(1, 10):
+            if i <= len(df) and df['涨跌幅'].iloc[-i] < 0:
+                down_days += 1
+            else:
                 break
 
-            match = re.search(r'\{.*\}', content, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group(0))
-                except:
-                    break
-            break
-        time.sleep(2)
-    return {}
+        tags = []
+        if cond_ma and cond_macd and cond_turnover: 
+            tags.append("🚀 右侧突破")
+        if 5 <= down_days <= 9: 
+            tags.append(f"🩸 连跌{down_days}天")
 
-# ── 微信推送：按板块聚合排版 ──────────────────────────────────────────────────
-def send_combined_to_wechat(webhook_url, collected_data, ai_comments_dict):
-    current_time = get_current_time()
-    content = f"**🚀 硬核科技板块监控报告**\n> 更新时间：<font color=\"comment\">{current_time}</font>\n\n"
+        if tags:
+            return True, " & ".join(tags), {
+                "name": stock_name, 
+                "code": symbol, 
+                "current_price": round(current_price, 2), 
+                "change_percent": change_pct
+            }
+        return False, "", {}
+    except:
+        return False, "", {}
 
-    for sector_name, info in collected_data.items():
-        avg_pct = info['avg_pct']
-        # 绿色字体(info)表示下跌，红色字体(warning)表示上涨
-        color = "warning" if avg_pct > 0 else ("info" if avg_pct < 0 else "comment")
-        
-        content += f"### 📊 【{sector_name}】 | 板块情绪：<font color=\"{color}\">{avg_pct}%</font>\n"
-        
-        ai_comment = ai_comments_dict.get(sector_name, "暂无分析数据。")
-        content += f"> 🤖 **AI 逻辑梳理**：\n> <font color=\"comment\">{ai_comment}</font>\n\n"
-        
-        content += "**[ 核心成分股异动 ]**\n"
-        for stock in info['stocks']:
-            sd = stock['data']
-            try:
-                pct = float(sd['change_percent'])
-            except ValueError:
-                pct = 0
-            s_color = "warning" if pct > 0 else "info"
-            
-            # 个股摘要
-            content += f"- **{sd['name']}** ({sd['code']})：价 **{sd['current_price']}** | 涨跌 <font color=\"{s_color}\">{sd['change_percent']}%</font>\n"
-            
-            # 只取第一条新闻展示，避免卡片过长导致微信截断
-            first_news = stock['news_titles'].split('\n')[0] if stock['news_titles'] else "> - 暂无相关资讯"
-            content += f"  {first_news}\n"
-        
-        content += "\n---\n"
-
-    payload = {"msgtype": "markdown", "markdown": {"content": content.strip()}}
+def fetch_news(stock_name):
+    """获取最新的一条相关新闻"""
+    keyword = quote(stock_name)
+    url = f"https://search.sina.com.cn/news/search?key={keyword}&range=title&channel=finance&num=1&format=json"
     try:
-        resp = requests.post(webhook_url, json=payload, timeout=10)
-        if resp.status_code == 200:
-            print("✅ 微信推送成功！")
-        else:
-            print(f"⚠️ 推送返回非 200: {resp.status_code} {resp.text}")
-    except Exception as e:
-        print(f"❌ 推送微信失败: {e}")
+        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=5).json()
+        item = r.get("result", {}).get("list", [])[0]
+        title = re.sub(r'<[^>]+>', '', item.get("headline", ""))
+        link = item.get("url", "")
+        return f"> - [{title}]({link})"
+    except:
+        return "> - 暂无实时相关资讯"
 
-# ── 主流程 ────────────────────────────────────────────────────────────────────
+def get_ai_commentary(context, api_key):
+    """调用 AI 总结板块整体情绪"""
+    if not context: return {}
+    prompt = f"你是硬核科技金融分析师。请对以下板块今日异动个股做150字左右的深度点评，分析板块是处于主升浪还是超跌反弹。请严格返回JSON格式，Key为板块名：\n\n{context}"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": "openrouter/free", 
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3
+    }
+    try:
+        r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=40)
+        res_text = r.json()['choices'][0]['message']['content']
+        match = re.search(r'\{.*\}', res_text, re.DOTALL)
+        return json.loads(match.group(0)) if match else {}
+    except:
+        return {}
+
 if __name__ == "__main__":
     WEBHOOK_URL = os.environ.get("WECHAT_WEBHOOK")
-    OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
-
-    if not WEBHOOK_URL or not OPENROUTER_KEY:
-        print("❌ 缺少环境变量 WECHAT_WEBHOOK 或 OPENROUTER_API_KEY")
+    API_KEY = os.environ.get("OPENROUTER_API_KEY")
+    
+    if not WEBHOOK_URL or not API_KEY:
+        print("❌ 环境变量未配置")
         exit(1)
 
-    # 【全新定义：基于板块的字典结构】
-    SECTORS = {
-        "光刻机与核心设备": [
-            "sz300346",  # 南大光电
-            "sh688012",  # 中微公司
-            "sh688037",  # 芯源微
-        ],
-        "无线电与射频芯片": [
-            "sz300136",  # 信维通信
-            "sh688270",  # 臻镭科技
-        ]
-    }
-
-    print("🔄 开始拉取板块数据...")
+    # 1. 行业板块名称 (匹配东财标准)
+    TARGET_SECTORS = ["半导体", "人工智能", "机器人"]
+    # 2. 市场池分类 (68开头科创板, 30开头创业板)
+    MARKET_POOLS = {"科创板": "68", "创业板": "30"}
+    
     collected_data = {}
-    all_sectors_context = ""
+    ai_context = ""
 
-    for sector_name, codes in SECTORS.items():
-        print(f"\n📁 处理板块: {sector_name}")
-        sector_stocks_info = []
-        sector_total_pct = 0.0
-        valid_count = 0
+    # 获取一份当前全市场快照，用于科创/创业板筛选
+    try:
+        all_spot = ak.stock_zh_a_spot_em()
+    except:
+        all_spot = pd.DataFrame()
 
-        for code in codes:
-            data = get_stock_data(code)
-            if not data: continue
-            
-            print(f"  ✅ {data['name']}: {data['change_percent']}%")
-            news_full, news_titles = get_latest_news(data['name'])
-            
-            sector_stocks_info.append({
-                "code": code,
-                "data": data,
-                "news_titles": news_titles,
-                "news_full": news_full # 留给 AI 分析用
-            })
-            
-            try:
-                sector_total_pct += float(data['change_percent'])
-                valid_count += 1
-            except ValueError:
-                pass
-            time.sleep(1)
-
-        sector_avg_pct = round(sector_total_pct / valid_count, 2) if valid_count > 0 else 0
+    # 遍历所有目标监控池
+    for name in TARGET_SECTORS + list(MARKET_POOLS.keys()):
+        print(f"🔎 正在扫描: {name}...")
         
-        collected_data[sector_name] = {
-            "avg_pct": sector_avg_pct,
-            "stocks": sector_stocks_info
-        }
+        # 获取基础股票列表
+        if name in TARGET_SECTORS:
+            try:
+                stocks = ak.stock_board_industry_cons_em(symbol=name)[['代码', '名称']].values.tolist()
+            except: continue
+        else:
+            if all_spot.empty: continue
+            # 筛选对应代码开头，并按涨跌幅排个序，取前100只活跃的扫，避免超时
+            prefix = MARKET_POOLS[name]
+            mask = all_spot['代码'].str.startswith(prefix)
+            stocks = all_spot[mask].sort_values(by="成交额", ascending=False).head(100)[['代码', '名称']].values.tolist()
 
-        # 拼接提供给 AI 的上下文
-        all_sectors_context += f"\n=== 【{sector_name}】 板块总体涨跌幅: {sector_avg_pct}% ===\n"
-        for stock in sector_stocks_info:
-            d = stock['data']
-            all_sectors_context += f"成分股 {d['name']} ({stock['code']}): 现价 {d['current_price']}, 涨跌幅 {d['change_percent']}%\n新闻: {stock['news_full']}\n"
+        triggered_list = []
+        for code, s_name in stocks:
+            is_hit, tag, data = analyze_stock_strategies(code, s_name)
+            if is_hit:
+                data['tag'] = tag
+                data['news'] = fetch_news(s_name)
+                triggered_list.append(data)
+            
+            # 每个板块达到5个就停止扫描，提高效率
+            if len(triggered_list) >= 5:
+                break
+            # 适当微调爬虫间隔
+            time.sleep(0.2)
 
+        if triggered_list:
+            collected_data[name] = triggered_list
+            ai_context += f"\n【{name}】: " + ",".join([s['name'] for s in triggered_list])
+
+    # 3. AI 研判与消息封装
+    ai_comments = get_ai_commentary(ai_context, API_KEY)
+    
+    msg = f"**🎯 硬核科技量化监控 (动态版)**\n> 扫描时间：{get_current_time()}\n\n"
+    
     if not collected_data:
-        print("❌ 所有股票数据均获取失败，退出")
-        exit(1)
+        msg += "> 💤 今日暂无个股触发筛选条件。"
+    else:
+        for sec, stocks in collected_data.items():
+            msg += f"### 📊 {sec}\n"
+            sec_comment = ai_comments.get(sec, "板块情绪博弈中，建议关注核心龙头。")
+            msg += f"> 🤖 **AI 战法研判**：\n> <font color=\"comment\">{sec_comment}</font>\n\n"
+            
+            for s in stocks:
+                color = "warning" if s['change_percent'] > 0 else "info"
+                msg += f"- **{s['name']}** ({s['code']}) | 现价 {s['current_price']} (<font color='{color}'>{s['change_percent']}%</font>)\n"
+                msg += f"  > 💡 战法信号：**<font color=\"warning\">{s['tag']}</font>**\n"
+                msg += f"  {s['news']}\n"
+            msg += "\n---\n"
 
-    print("\n" + "="*50)
-    ai_comments_dict = get_batch_ai_analysis(all_sectors_context, OPENROUTER_KEY)
-
-    print("\n📤 准备发送微信整合卡片...")
-    send_combined_to_wechat(WEBHOOK_URL, collected_data, ai_comments_dict)
-    print("🎉 执行完毕！")
+    # 4. 发送
+    requests.post(WEBHOOK_URL, json={"msgtype": "markdown", "markdown": {"content": msg.strip()}})
+    print(f"✅ 处理完成，扫描到 {len(collected_data)} 个板块有信号")
