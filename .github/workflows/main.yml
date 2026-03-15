@@ -1,24 +1,41 @@
 name: Stock Monitor Bot
+
 on:
-  push:
-    branches: [ "main" ]
+  # 移除了 push: branches: [ "main" ]，防止每次提交代码都触发推送
+  
   schedule:
-    - cron: '0 2,3,6,7 * * 1-5'
+    # 对应北京时间 (UTC+8):
+    # 02:00 UTC -> 10:00 盘中监控
+    # 03:00 UTC -> 11:00 盘中监控
+    # 06:00 UTC -> 14:00 尾盘预警
+    # 07:15 UTC -> 15:15 收盘总结
+    - cron: '0 2,3,6 * * 1-5'
+    - cron: '15 7 * * 1-5'
+
+  # 保留此项：允许在 GitHub Actions 页面手动点击 "Run workflow" 按钮触发
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
     - name: 检出代码
       uses: actions/checkout@v3
+
     - name: 配置 Python 环境
       uses: actions/setup-python@v4
       with:
         python-version: '3.10'
+
     - name: 安装依赖包
       run: |
         python -m pip install --upgrade pip
         pip install requests pandas akshare
+
     - name: 运行监控脚本
       env:
         WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
