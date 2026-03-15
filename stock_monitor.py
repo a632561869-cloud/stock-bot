@@ -167,12 +167,12 @@ def get_latest_news(stock_name):
 # ── AI 分析：多模型自动切换 ───────────────────────────────────────────────────
 # 优先使用稳定的免费模型；全部失败时用最后一个付费回落
 FREE_MODELS = [
-    "google/gemini-2.0-flash-exp:free",        # Google 免费，稳定
-    "google/gemini-2.5-pro-exp-03-25:free",    # Google 实验版
-    "deepseek/deepseek-chat-v3-0324:free",     # DeepSeek V3
-    "qwen/qwen3-235b-a22b:free",               # Qwen3 大模型
-    "meta-llama/llama-4-maverick:free",        # Llama 4
-    "mistralai/mistral-small-3.1-24b-instruct:free",  # Mistral
+    "qwen/qwen3-coder:free",       
+    "qwen/qwen3-next-80b-a3b-instruct:free",    
+    "openai/gpt-oss-120b:free",    
+    "qwen/qwen3-235b-a22b:free",               
+    "qwen/qwen3-4b:free",
+    "meta-llama/llama-3.3-70b-instruct:free", 
 ]
 MAX_RETRIES = 3
 RETRY_DELAY = 5  # 秒
