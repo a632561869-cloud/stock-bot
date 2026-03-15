@@ -1,35 +1,26 @@
 name: Stock Monitor Bot
-
 on:
   push:
-    branches: [ "main" ] # 你只要一修改代码，就会立刻触发一次，方便我们测试！
+    branches: [ "main" ]
   schedule:
-    # 定时任务：工作日(周一到周五)的北京时间 10点, 11点, 14点, 15点 运行
-    # (注意：GitHub用的是UTC时间，比北京慢8小时，所以这里写的是 2,3,6,7)
     - cron: '0 2,3,6,7 * * 1-5'
-  workflow_dispatch:  # <--- 就是加上这一行，这就是手动触发的开关！
+  workflow_dispatch:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
     - name: 检出代码
       uses: actions/checkout@v3
-
     - name: 配置 Python 环境
       uses: actions/setup-python@v4
       with:
         python-version: '3.10'
-
     - name: 安装依赖包
       run: |
         python -m pip install --upgrade pip
-        pip install requests
-        pip install requests duckduckgo-search
-
+        pip install requests ddgs
     - name: 运行监控脚本
       env:
-        # 把保险箱里的 Webhook 地址拿出来给 Python 用
         WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
         OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       run: python stock_monitor.py
