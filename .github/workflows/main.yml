@@ -30,4 +30,5 @@ jobs:
       env:
         # 把保险箱里的 Webhook 地址拿出来给 Python 用
         WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+        OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       run: python stock_monitor.py
