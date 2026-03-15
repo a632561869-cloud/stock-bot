@@ -1,23 +1,21 @@
+import warnings
+# 🤫 暴力魔法：屏蔽全局所有烦人的黄色警告
+warnings.filterwarnings("ignore")
+
 import requests
 import os
 import datetime
 import time
 import json
-import warnings
-
-# 🤫 核心魔法：物理屏蔽 duckduckgo_search 那个烦人的改名警告
-warnings.filterwarnings("ignore", category=RuntimeWarning, module="duckduckgo_search")
-
+import re  # 新增：用于强大的正则表达式提取
 from duckduckgo_search import DDGS
 
 def get_current_time():
-    """获取标准时间 (UTC+8)"""
     utc_now = datetime.datetime.utcnow()
     beijing_now = utc_now + datetime.timedelta(hours=8)
     return beijing_now.strftime("%Y-%m-%d %H:%M:%S")
 
 def get_stock_data(stock_code):
-    """获取基础股票数据"""
     url = f"http://qt.gtimg.cn/q={stock_code}"
     try:
         response = requests.get(url, timeout=10)
@@ -35,7 +33,6 @@ def get_stock_data(stock_code):
         return None
 
 def get_latest_news(stock_name):
-    """搜索最新新闻，并提取超链接"""
     try:
         results = DDGS().text(f"{stock_name} 股票 财经 最新消息", max_results=3)
         if not results:
@@ -48,10 +45,7 @@ def get_latest_news(stock_name):
             body = r.get('body', '')
             url = r.get('href', '')
             
-            # 喂给 AI 的纯文本格式
             news_list.append(f"标题：{title} \n摘要：{body}")
-            
-            # 🌟 生成 Markdown 可点击链接格式
             if url:
                 titles_for_display.append(f"> - [{title}]({url})")
             else:
@@ -59,21 +53,21 @@ def get_latest_news(stock_name):
             
         return "\n".join(news_list), "\n".join(titles_for_display)
     except Exception as e:
-        print(f"新闻抓取异常: {e}")
+        # 🔍 透视眼：打印新闻失败的真正原因
+        print(f"❌ 抓取 [{stock_name}] 新闻被拦截或报错: {e}")
         return "新闻抓取失败。", "> - 暂无新闻数据"
 
 def get_batch_ai_analysis(all_stocks_context, api_key):
-    """一次性请求 AI，要求返回 JSON"""
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
     
-    prompt = f"""你是专业的金融分析师。请结合以下多只股票的盘面数据和资讯，为每只股票写一段100字左右的客观点评（语气沉稳，无投资建议）。
+    prompt = f"""你是专业的金融分析师。请结合以下多只股票的盘面数据和资讯，为每只股票写一段100字左右的客观点评。
 
 【极其重要的格式指令】
-你必须且只能返回一个合法的 JSON 对象，绝对不要包含任何 Markdown 标记，不要包含任何额外的解释文本。
+你必须且只能返回一个合法的 JSON 对象，绝对不要包含任何 Markdown 标记，不要解释！
 返回格式示例：
 {{
     "sz000001": "平安银行今日走势...",
@@ -95,21 +89,34 @@ def get_batch_ai_analysis(all_stocks_context, api_key):
         
         if response.status_code == 200:
             content = response.json()['choices'][0]['message']['content']
-            content = content.replace("```json", "").replace("```", "").strip()
-            return json.loads(content) 
+            
+            # 🔍 透视眼：看看 AI 到底回复了什么鬼东西
+            print(f"💡 AI 原始回复内容:\n{content}\n")
+            
+            # 🛡️ 强力装甲：使用正则表达式强行抠出 JSON 字典
+            match = re.search(r'\{.*\}', content, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(0))
+                except Exception as e:
+                    print(f"❌ 正则提取到了字典，但 JSON 依然无法解析: {e}")
+                    return {}
+            else:
+                print("❌ AI 的回复中根本找不到 JSON 结构！")
+                return {}
         else:
+            print(f"❌ AI 接口再次拒绝请求！状态码: {response.status_code}")
+            print(f"❌ 官方报错信息: {response.text}")
             return {}
-    except:
+    except Exception as e:
+        print(f"❌ AI 网络请求彻底崩溃: {e}")
         return {}
 
 def send_combined_to_wechat(webhook_url, collected_data, ai_comments_dict):
-    """将所有股票拼接成一个长卡片发送"""
     current_time = get_current_time()
     
-    # 🌟 卡片头部
     content = f"**📈 股票深度监控报告**\n> 更新时间：<font color=\"comment\">{current_time}</font>\n\n"
     
-    # 🌟 循环遍历每只股票，拼接到同一个字符串中
     for index, (code, info) in enumerate(collected_data.items()):
         stock_data = info['data']
         news_titles_display = info['news_titles']
@@ -117,7 +124,6 @@ def send_combined_to_wechat(webhook_url, collected_data, ai_comments_dict):
         
         color = "warning" if float(stock_data['change_percent']) > 0 else "info"
         
-        # 组装单只股票的区块
         content += f"""**{index + 1}. {stock_data['name']} ({stock_data['code']})**
 > 当前价格：**{stock_data['current_price']}** | 今日涨跌：<font color="{color}">{stock_data['change_percent']}%</font>
 > 📰 **最新资讯**：
@@ -136,7 +142,7 @@ def send_combined_to_wechat(webhook_url, collected_data, ai_comments_dict):
         requests.post(webhook_url, json=payload, timeout=10)
         print("✅ 整合卡片推送成功！")
     except Exception as e:
-        print(f"❌ 推送失败: {e}")
+        print(f"❌ 推送微信失败: {e}")
 
 if __name__ == "__main__":
     WEBHOOK_URL = os.environ.get("WECHAT_WEBHOOK")
@@ -166,7 +172,6 @@ if __name__ == "__main__":
                 all_stocks_context += f"当前价：{data['current_price']}，涨跌幅：{data['change_percent']}%\n"
                 all_stocks_context += f"相关新闻：\n{news_full}\n"
                 
-                # 保持休眠时间，防止搜新闻被屏蔽
                 time.sleep(2) 
                 
         if collected_data:
