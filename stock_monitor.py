@@ -3,7 +3,12 @@ import os
 import datetime
 import time
 import json
-from ddgs import DDGS
+import warnings
+
+# 🤫 核心魔法：物理屏蔽 duckduckgo_search 那个烦人的改名警告
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="duckduckgo_search")
+
+from duckduckgo_search import DDGS
 
 def get_current_time():
     """获取标准时间 (UTC+8)"""
@@ -46,7 +51,7 @@ def get_latest_news(stock_name):
             # 喂给 AI 的纯文本格式
             news_list.append(f"标题：{title} \n摘要：{body}")
             
-            # 🌟 核心修改：生成 Markdown 可点击链接格式 [标题](链接)
+            # 🌟 生成 Markdown 可点击链接格式
             if url:
                 titles_for_display.append(f"> - [{title}]({url})")
             else:
@@ -161,7 +166,7 @@ if __name__ == "__main__":
                 all_stocks_context += f"当前价：{data['current_price']}，涨跌幅：{data['change_percent']}%\n"
                 all_stocks_context += f"相关新闻：\n{news_full}\n"
                 
-                # 保持原有的休眠时间，防止搜新闻被屏蔽
+                # 保持休眠时间，防止搜新闻被屏蔽
                 time.sleep(2) 
                 
         if collected_data:
