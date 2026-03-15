@@ -126,7 +126,7 @@ def fetch_news_from_eastmoney(stock_name):
 # ── 新闻方案 4：DuckDuckGo（原方案，保留为最终备用）─────────────────────────────
 def fetch_news_from_ddg(stock_name):
     try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
         results = DDGS().text(f"{stock_name} 股票 财经 最新消息", max_results=3)
         if not results:
             return None, None
@@ -165,17 +165,18 @@ def get_latest_news(stock_name):
 
 
 # ── AI 分析：多模型自动切换 ───────────────────────────────────────────────────
-# 优先使用稳定的免费模型；全部失败时用最后一个付费回落
+# openrouter/free = 官方自动路由器，从所有可用免费模型中随机挑，最稳定
+# 其余为具体模型 ID 备用（ID 均已验证真实存在）
 FREE_MODELS = [
-    "qwen/qwen3-coder:free",       
-    "qwen/qwen3-next-80b-a3b-instruct:free",    
-    "openai/gpt-oss-120b:free",    
-    "qwen/qwen3-235b-a22b:free",               
-    "qwen/qwen3-4b:free",
-    "meta-llama/llama-3.3-70b-instruct:free", 
+    "openrouter/free",                                  # ★ 首选：官方自动路由，永远有效
+    "google/gemini-2.0-flash-exp:free",                # Google，稳定
+    "meta-llama/llama-3.3-70b-instruct:free",          # Meta Llama，稳定
+    "deepseek/deepseek-chat-v3-0324:free",             # DeepSeek V3
+    "mistralai/mistral-small-3.1-24b-instruct:free",   # Mistral
+    "qwen/qwen3-235b-a22b:free",                       # Qwen3（备用）
 ]
 MAX_RETRIES = 3
-RETRY_DELAY = 5  # 秒
+RETRY_DELAY = 8  # 秒，429 限流等待时间稍长一点
 
 def call_openrouter(api_key, model, prompt, timeout=60):
     """单次 API 调用，返回 (content_str, error_str)"""
