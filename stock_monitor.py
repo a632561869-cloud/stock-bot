@@ -21,14 +21,38 @@ def to_sina_code(code: str) -> str:
 
 # ── 步骤 1：获取全量股票列表 ──────────────────────────────
 def get_stock_list(prefix: str) -> list:
+    """获取全量股票代码，增加异常兼容性"""
     rs = bs.query_stock_basic(code_name="")
     rows = []
     while rs.error_code == "0" and rs.next():
         rows.append(rs.get_row_data())
+    
+    if not rows:
+        return []
+        
     df = pd.DataFrame(rows, columns=rs.fields)
-    # 过滤掉退市、非正常上市股
-    df = df[(df["type"] == "1") & (df["status"] == "1")]
-    codes = df["code"].str.split(".").str[1]
+    
+    # 打印列名以便调试（仅在 Actions 日志中可见）
+    # print(f"DEBUG: Baostock columns: {df.columns.tolist()}")
+
+    # 兼容性处理：尝试过滤，如果字段不存在则跳过过滤直接取代码
+    try:
+        if 'type' in df.columns and 'status' in df.columns:
+            df = df[(df["type"] == "1") & (df["status"] == "1")]
+        elif 'TYPE' in df.columns and 'STATUS' in df.columns:
+            df = df[(df["TYPE"] == "1") & (df["STATUS"] == "1")]
+    except:
+        pass
+
+    # 提取纯数字代码 (例如从 "sh.600000" 提取 "600000")
+    if "code" in df.columns:
+        codes = df["code"].str.split(".").str[1]
+    elif "CODE" in df.columns:
+        codes = df["CODE"].str.split(".").str[1]
+    else:
+        # 最后的保底方案
+        codes = df.iloc[:, 0].str.split(".").str[1]
+        
     return codes[codes.str.startswith(prefix)].tolist()
 
 # ── 步骤 2：实时行情与资讯获取 ───────────────────────────
