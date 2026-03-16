@@ -1,19 +1,11 @@
 name: Stock Monitor Bot
 
 on:
-  # 移除了 push: branches: [ "main" ]，防止每次提交代码都触发推送
   schedule:
-    # 对应北京时间 (UTC+8):
-    # 02:15 UTC -> 10:15 (早盘确认，换手率初步释放)
-    # 03:00 UTC -> 11:00 (早盘总结)
-    # 06:10 UTC -> 14:10 (尾盘博弈，右侧信号最强时)
-    # 07:15 UTC -> 15:15 (全天收盘总结)
-    - cron: '17 2 * * 1-5'  # 实际北京时间 10:17 触发
-    - cron: '4 3 * * 1-5'   # 实际北京时间 11:04 触发
-    - cron: '13 6 * * 1-5'  # 实际北京时间 14:13 触发
-    - cron: '18 7 * * 1-5'  # 实际北京时间 15:18 触发
-
-  # 保留此项：允许在 GitHub Actions 页面手动点击 "Run workflow" 按钮触发
+    - cron: '17 2 * * 1-5'  # 10:17 北京时间
+    - cron: '4 3 * * 1-5'   # 11:04 北京时间
+    - cron: '13 6 * * 1-5'  # 14:13 北京时间
+    - cron: '18 7 * * 1-5'  # 15:18 北京时间
   workflow_dispatch:
 
 concurrency:
@@ -23,6 +15,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20  # 增加超时保护，防止请求阻塞
+    
     steps:
     - name: 检出代码
       uses: actions/checkout@v3
@@ -31,6 +25,7 @@ jobs:
       uses: actions/setup-python@v4
       with:
         python-version: '3.10'
+        cache: 'pip' # 自动缓存依赖，加快下次运行速度
 
     - name: 安装依赖包
       run: |
@@ -41,4 +36,5 @@ jobs:
       env:
         WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
         OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      # 如果脚本运行报错，GitHub 会发邮件通知你
       run: python stock_monitor.py
