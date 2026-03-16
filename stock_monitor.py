@@ -1,16 +1,54 @@
 import warnings
 warnings.filterwarnings("ignore")
-import requests, os, datetime, time, json, re
-from urllib.parse import quote
-import pandas as pd
-import baostock as bs
+
+import requests
+import os
+import datetime
+import time
+import json
+import re
+import logging
 from datetime import timezone, timedelta
 
+import pandas as pd
+import baostock as bs
+
+# ── 日志配置 ──────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger(__name__)
+
+# ── 集中配置 ──────────────────────────────────────────────
+CONFIG = {
+    "min_amount":        1e8,       # 预筛最低成交额（1亿）
+    "min_market_cap":    5e9,       # 最低流通市值（50亿）
+    "pe_min":            10,
+    "pe_max":            30,
+    "pb_max":            5,
+    "top_n_candidates":  40,        # 每板块取成交额前N支
+    "max_hits_per_pool": 5,         # 每板块最多保留命中数
+    "history_days":      150,       # 日线历史天数
+    "weekly_days":       400,       # 周线历史天数
+    "min_history_rows":  65,        # 最少历史行数
+    "ai_timeout":        40,        # AI接口超时秒数
+    "ai_max_tokens":     500,
+    "sina_batch":        60,        # 新浪批量查询条数
+    "sina_timeout":      10,
+}
+
+SCAN_POOLS = {
+    "科创/创业板": ["688", "300"],
+    "主板精选":   ["60",  "00"],
+}
+
 # ── 基础工具 ──────────────────────────────────────────────
-def get_beijing_time():
+def get_beijing_time() -> datetime.datetime:
     return datetime.datetime.now(timezone(timedelta(hours=8)))
 
-def get_current_time():
+def get_current_time() -> str:
     return get_beijing_time().strftime("%Y-%m-%d %H:%M:%S")
 
 def to_bs_code(code: str) -> str:
@@ -19,215 +57,312 @@ def to_bs_code(code: str) -> str:
 def to_sina_code(code: str) -> str:
     return f"sh{code}" if code.startswith(("60", "68")) else f"sz{code}"
 
-# ── 步骤 1：获取全量股票列表 ──────────────────────────────
+# ── 步骤 1：获取股票列表 ──────────────────────────────────
 def get_stock_list(prefix: str) -> list:
-    """获取全量股票代码，增加异常兼容性"""
     rs = bs.query_stock_basic(code_name="")
     rows = []
     while rs.error_code == "0" and rs.next():
         rows.append(rs.get_row_data())
-    
     if not rows:
+        logger.warning(f"[{prefix}] 获取股票列表为空")
         return []
-        
+
     df = pd.DataFrame(rows, columns=rs.fields)
-    
-    # 打印列名以便调试（仅在 Actions 日志中可见）
-    # print(f"DEBUG: Baostock columns: {df.columns.tolist()}")
+    df.columns = [c.lower() for c in df.columns]
 
-    # 兼容性处理：尝试过滤，如果字段不存在则跳过过滤直接取代码
-    try:
-        if 'type' in df.columns and 'status' in df.columns:
-            df = df[(df["type"] == "1") & (df["status"] == "1")]
-        elif 'TYPE' in df.columns and 'STATUS' in df.columns:
-            df = df[(df["TYPE"] == "1") & (df["STATUS"] == "1")]
-    except:
-        pass
+    if "status" in df.columns:
+        df = df[df["status"] == "1"]
 
-    # 提取纯数字代码 (例如从 "sh.600000" 提取 "600000")
-    if "code" in df.columns:
-        codes = df["code"].str.split(".").str[1]
-    elif "CODE" in df.columns:
-        codes = df["CODE"].str.split(".").str[1]
-    else:
-        # 最后的保底方案
-        codes = df.iloc[:, 0].str.split(".").str[1]
-        
-    return codes[codes.str.startswith(prefix)].tolist()
+    codes = df["code"].str.split(".").str[1]
+    result = codes[codes.str.startswith(prefix)].tolist()
+    logger.info(f"[{prefix}] 获取上市股票 {len(result)} 支")
+    return result
 
-# ── 步骤 2：实时行情与资讯获取 ───────────────────────────
-def fetch_news(stock_name: str) -> str:
-    """搜索该个股最新资讯标题及链接"""
-    clean_name = stock_name.replace(" ", "").replace("A", "")
-    keyword = quote(clean_name)
-    url = f"https://search.sina.com.cn/news/search?key={keyword}&channel=finance&num=3&format=json"
-    try:
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5).json()
-        news_list = r.get("result", {}).get("list", [])
-        if news_list:
-            item = news_list[0]
-            title = re.sub(r'<[^>]+>', '', item.get('headline', ''))
-            return f"{title} (链接: {item.get('url', '')})"
-    except:
-        pass
-    return "暂无实时深度资讯"
-
+# ── 步骤 2：极速批量快照 ──────────────────────────────────
 def fetch_realtime_sina(code_list: list) -> pd.DataFrame:
-    BATCH = 60
+    BATCH = CONFIG["sina_batch"]
     all_rows = []
-    headers = {"Referer": "https://finance.sina.com.cn", "User-Agent": "Mozilla/5.0"}
+    headers = {
+        "Referer": "https://finance.sina.com.cn",
+        "User-Agent": "Mozilla/5.0",
+    }
     for i in range(0, len(code_list), BATCH):
         batch = code_list[i: i + BATCH]
         sina_param = ",".join(to_sina_code(c) for c in batch)
         url = f"https://hq.sinajs.cn/list={sina_param}"
         try:
-            resp = requests.get(url, headers=headers, timeout=15)
+            resp = requests.get(url, headers=headers, timeout=CONFIG["sina_timeout"])
             resp.encoding = "gbk"
             for line in resp.text.strip().split("\n"):
-                if "=" not in line or '"' not in line: continue
+                if "=" not in line or '"' not in line:
+                    continue
                 raw_code = line.split("hq_str_")[1].split("=")[0].strip()[2:]
-                content = line.split('"')[1]
-                if not content: continue
-                parts = content.split(",")
-                yesterday_close = float(parts[2]) if parts[2] else 0.0
-                current_price = float(parts[3]) if parts[3] else 0.0
-                amount_yuan = float(parts[9]) if parts[9] else 0.0
-                pct_chg = round((current_price - yesterday_close) / yesterday_close * 100, 2) if yesterday_close > 0 else 0.0
-                if "ST" in parts[0].upper() or "退" in parts[0]: continue
-                all_rows.append({"name": parts[0], "code": raw_code, "price": current_price, "pct_chg": pct_chg, "amount": amount_yuan})
-        except: continue
-        time.sleep(0.4)
-    return pd.DataFrame(all_rows)
+                parts = line.split('"')[1].split(",")
+                # 新浪快照至少32个字段，少于此说明数据不完整
+                if len(parts) < 32:
+                    continue
+                try:
+                    y_close = float(parts[2])
+                    now_p   = float(parts[3])
+                    amount  = float(parts[9])
+                except (ValueError, IndexError):
+                    continue
+                if y_close <= 0:
+                    continue
+                pct = round((now_p - y_close) / y_close * 100, 2)
+                # 过滤ST及退市股
+                if "ST" in parts[0] or "退" in parts[0]:
+                    continue
+                all_rows.append({
+                    "name":   parts[0],
+                    "code":   raw_code,
+                    "price":  now_p,
+                    "pct":    pct,
+                    "amount": amount,
+                })
+        except Exception as e:
+            logger.warning(f"新浪快照请求失败 (batch {i}): {e}")
+            continue
 
-# ── 步骤 3：核心策略计算逻辑 ─────────────────────────────
+    df = pd.DataFrame(all_rows)
+    logger.info(f"快照获取完成，有效股票 {len(df)} 支")
+    return df
+
+# ── 步骤 3：多维度量化计算（每线程独立登录） ──────────────
 def analyze_stock_strategies(code: str, stock_name: str) -> tuple:
-    bj_now = get_beijing_time()
-    end_dt = bj_now.strftime("%Y-%m-%d")
-    start_dt = (bj_now - datetime.timedelta(days=150)).strftime("%Y-%m-%d")
-    
-    try:
-        # 1. 获取日线数据（包含PE/PB）
-        rs = bs.query_history_k_data_plus(to_bs_code(code), "date,close,high,low,volume,amount,pctChg,turn,peTTM,pbMRQ",
-                                          start_date=start_dt, end_date=end_dt, frequency="d", adjustflag="2")
-        rows = []
-        while rs.error_code == "0" and rs.next(): rows.append(rs.get_row_data())
-        if len(rows) < 65: return False, "", {}
-        df = pd.DataFrame(rows, columns=["date","close","high","low","volume","amount","pctChg","turn","peTTM","pbMRQ"])
-        df.iloc[:, 1:] = df.iloc[:, 1:].apply(pd.to_numeric, errors="coerce")
-
-        # 【逻辑1：基本面筛选】 PE 10-30, PB < 5, 市值 > 50亿
-        pe, pb = df["peTTM"].iloc[-1], df["pbMRQ"].iloc[-1]
-        circ_mv = (df["amount"].iloc[-1] / (df["turn"].iloc[-1] / 100)) if df["turn"].iloc[-1] > 0 else 0
-        if not (10 <= pe <= 30) or not (0 < pb <= 5) or circ_mv < 50_0000_0000:
-            return False, "", {}
-
-        # 【逻辑2：均线趋势】 股价 > MA10, MA20; MA60 走平或向上
-        df["MA10"] = df["close"].rolling(10).mean()
-        df["MA20"] = df["close"].rolling(20).mean()
-        df["MA60"] = df["close"].rolling(60).mean()
-        df["VMA5"] = df["volume"].rolling(5).mean()
-        if df["close"].iloc[-1] < df["MA10"].iloc[-1] or df["close"].iloc[-1] < df["MA20"].iloc[-1] or df["MA60"].iloc[-1] < df["MA60"].iloc[-5]:
-            return False, "", {}
-
-        # 【逻辑3：KDJ不超买 & MACD不恶化】
-        min_9, max_9 = df['low'].rolling(9).min(), df['high'].rolling(9).max()
-        rsv = (df['close'] - min_9) / (max_9 - min_9) * 100
-        k = rsv.ewm(com=2, adjust=False).mean()
-        d = k.ewm(com=2, adjust=False).mean()
-        j = 3 * k - 2 * d
-        if j.iloc[-1] > 80: return False, "", {} # 排除超买
-
-        exp1, exp2 = df['close'].ewm(span=12, adjust=False).mean(), df['close'].ewm(span=26, adjust=False).mean()
-        dif, dea = exp1 - exp2, (exp1 - exp2).ewm(span=9, adjust=False).mean()
-        macd_val = 2 * (dif - dea)
-        if dif.iloc[-1] < dea.iloc[-1] and macd_val.iloc[-1] < macd_val.iloc[-2]: return False, "", {}
-
-        # 【逻辑4：放量信号】 近3天内有放量阳线
-        has_vol = any((df['pctChg'].iloc[i] > 0 and df['volume'].iloc[i] > 1.5 * df['VMA5'].iloc[i]) for i in range(-3, 0))
-        if not has_vol: return False, "", {}
-
-        # 【逻辑5：周线共振】
-        rs_w = bs.query_history_k_data_plus(to_bs_code(code), "date,close", start_date=(bj_now - datetime.timedelta(days=360)).strftime("%Y-%m-%d"), frequency="w", adjustflag="2")
-        ws = []
-        while rs_w.error_code == "0" and rs_w.next(): ws.append(rs_w.get_row_data())
-        df_w = pd.DataFrame(ws, columns=["date","close"])
-        df_w["close"] = pd.to_numeric(df_w["close"])
-        dif_w = df_w['close'].ewm(span=12).mean() - df_w['close'].ewm(span=26).mean()
-        dea_w = dif_w.ewm(span=9).mean()
-        if dif_w.iloc[-1] < dea_w.iloc[-1] and (dif_w.iloc[-1] - dea_w.iloc[-1]) < (dif_w.iloc[-2] - dea_w.iloc[-2]):
-            return False, "", {} # 周线不能处于死叉扩大状态
-
-        # 组装数据流给 AI
-        news_str = fetch_news(stock_name)
-        ai_desc = (f"个股:{stock_name}, 涨幅:{df['pctChg'].iloc[-1]}%, 换手:{round(df['turn'].iloc[-1],2)}%, "
-                   f"PE:{round(pe,1)}, 信号:多周期共振突破, 最新资讯:{news_str}")
-
-        return True, "🚀 多周期共振", {"name": stock_name, "code": code, "price": df["close"].iloc[-1], "pct": df["pctChg"].iloc[-1], "news": news_str, "ai_desc": ai_desc}
-    except: return False, "", {}
-
-# ── 步骤 4：AI 研判与推送 ────────────────────────────────
-def get_ai_commentary(context: str, api_key: str) -> dict:
-    if not context: return {}
-    prompt = (
-        "你是一个专业的首席策略分析师。我会为你提供一组异动个股的量化数据（涨幅、换手率、PE）及相关新闻。\n"
-        "请结合这些数据，给出150字左右的深度点评。重点分析：资金介入程度、估值安全性及后续趋势。\n"
-        "必须严格返回 JSON 格式，Key 为板块名，内容为点评文字。\n\n" + context
-    )
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {"model": "openrouter/free", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3}
-    try:
-        r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=50)
-        res_text = r.json()["choices"][0]["message"]["content"].strip()
-        clean_text = re.sub(r'^```json\s*|```$', '', res_text, flags=re.MULTILINE).strip()
-        match = re.search(r'\{.*\}', clean_text, re.DOTALL)
-        return json.loads(match.group(0)) if match else {"RAW_ERROR": res_text}
-    except: return {"RAW_ERROR": "AI 分析暂时缺席，技术形态符合多周期筛选。"}
-
-if __name__ == "__main__":
-    WEBHOOK_URL = os.environ.get("WECHAT_WEBHOOK")
-    API_KEY = os.environ.get("OPENROUTER_API_KEY")
-    if not WEBHOOK_URL: print("❌ 缺失环境变量"); exit(1)
-
+    """
+    每个线程独立调用 bs.login() / bs.logout()，避免多线程共用
+    同一 socket 连接导致数据错乱。
+    """
     bs.login()
-    SCAN_POOLS = {"科创/创业板": ["688", "300"], "主板精选": ["60", "00"]}
-    collected_data, ai_context = {}, ""
-    
     try:
-        for pool_name, prefixes in SCAN_POOLS.items():
-            triggered = []
-            for prefix in prefixes:
-                codes = get_stock_list(prefix)
-                snapshot = fetch_realtime_sina(codes)
-                if snapshot.empty: continue
-                # 初筛：成交额 > 1亿
-                candidates = snapshot[snapshot["amount"] >= 100000000].sort_values("amount", ascending=False).head(50)
-                for _, row in candidates.iterrows():
-                    is_hit, tag, data = analyze_stock_strategies(row['code'], row['name'])
-                    if is_hit:
-                        triggered.append(data)
-                    if len(triggered) >= 5: break
-            
-            if triggered:
-                collected_data[pool_name] = triggered
-                ai_context += f"\n【{pool_name}板块详情】:\n" + "\n".join([s["ai_desc"] for s in triggered])
+        return _do_analyze(code, stock_name)
+    except Exception as e:
+        logger.warning(f"[{code}] {stock_name} 分析异常: {e}")
+        return False, "", {}
     finally:
         bs.logout()
 
-    ai_comments = get_ai_commentary(ai_context, API_KEY)
-    msg = f"**🎯 硬核量化监控 (价值+共振版)**\n> 扫描时间：{get_current_time()}\n\n"
-    
-    if not collected_data:
-        msg += "> 💤 今日暂无满足 PE 10-30 & 市值 > 50亿 & 多周期共振的标的。"
-    else:
-        for sec, stocks in collected_data.items():
-            msg += f"### 📊 {sec}\n"
-            sec_comment = ai_comments.get(sec, ai_comments.get("RAW_ERROR", "个股技术形态共振向上。"))
-            msg += f"> 🤖 **AI 战法研判**：\n> <font color=\"comment\">{sec_comment}</font>\n\n"
-            for s in stocks:
-                color = "warning" if s["pct"] > 0 else "info"
-                msg += f"- **{s['name']}** ({s['code']}) | {s['price']} (<font color='{color}'>{s['pct']}%</font>)\n"
-                msg += f"  {s['news']}\n"
-            msg += "\n---\n"
+def _do_analyze(code: str, stock_name: str) -> tuple:
+    bj_now   = get_beijing_time()
+    end_dt   = bj_now.strftime("%Y-%m-%d")
+    start_dt = (bj_now - datetime.timedelta(days=CONFIG["history_days"])).strftime("%Y-%m-%d")
 
-    requests.post(WEBHOOK_URL, json={"msgtype": "markdown", "markdown": {"content": msg.strip()}})
-    print("✅ 任务完成")
+    rs = bs.query_history_k_data_plus(
+        to_bs_code(code),
+        "date,close,high,low,volume,amount,pctChg,turn,peTTM,pbMRQ",
+        start_date=start_dt,
+        end_date=end_dt,
+        frequency="d",
+        adjustflag="2",
+    )
+    rows = []
+    while rs.error_code == "0" and rs.next():
+        rows.append(rs.get_row_data())
+
+    if len(rows) < CONFIG["min_history_rows"]:
+        return False, "", {}
+
+    df = pd.DataFrame(rows, columns=["date", "close", "high", "low",
+                                      "volume", "amount", "pctChg", "turn",
+                                      "peTTM", "pbMRQ"])
+    df.iloc[:, 1:] = df.iloc[:, 1:].apply(pd.to_numeric, errors="coerce")
+
+    # ── 基本面过滤 ────────────────────────────────────────
+    pe = df["peTTM"].iloc[-1]
+    pb = df["pbMRQ"].iloc[-1]
+    turn_last = df["turn"].iloc[-1]
+
+    if pd.isna(pe) or pd.isna(pb) or pd.isna(turn_last):
+        return False, "", {}
+
+    circ_mv = (df["amount"].iloc[-1] / (turn_last / 100)) if turn_last > 0 else 0
+
+    if not (CONFIG["pe_min"] <= pe <= CONFIG["pe_max"]):
+        return False, "", {}
+    if not (0 < pb <= CONFIG["pb_max"]):
+        return False, "", {}
+    if circ_mv < CONFIG["min_market_cap"]:
+        return False, "", {}
+
+    # ── 技术面过滤 ────────────────────────────────────────
+    df["MA10"] = df["close"].rolling(10).mean()
+    df["MA20"] = df["close"].rolling(20).mean()
+    df["MA60"] = df["close"].rolling(60).mean()
+
+    if df["close"].iloc[-1] < df["MA10"].iloc[-1]:
+        return False, "", {}
+    if df["MA60"].iloc[-1] < df["MA60"].iloc[-5]:
+        return False, "", {}
+
+    # ── 周线共振 ──────────────────────────────────────────
+    start_w = (bj_now - datetime.timedelta(days=CONFIG["weekly_days"])).strftime("%Y-%m-%d")
+    rs_w = bs.query_history_k_data_plus(
+        to_bs_code(code), "date,close",
+        start_date=start_w,
+        frequency="w",
+        adjustflag="2",
+    )
+    ws = []
+    while rs_w.error_code == "0" and rs_w.next():
+        ws.append(rs_w.get_row_data())
+
+    df_w = pd.DataFrame(ws, columns=["date", "close"])
+    df_w["close"] = pd.to_numeric(df_w["close"], errors="coerce")
+
+    dif_w = df_w["close"].ewm(span=12).mean() - df_w["close"].ewm(span=26).mean()
+    dea_w = dif_w.ewm(span=9).mean()
+
+    tags = ["🎯 估值安全", "📈 多周期共振", f"PE:{round(pe, 1)}"]
+    if dif_w.iloc[-1] > dea_w.iloc[-1]:
+        tags.append("🟢 周线金叉")
+
+    ai_desc = (
+        f"{stock_name}("
+        f"涨跌:{df['pctChg'].iloc[-1]}%,"
+        f"换手:{round(turn_last, 2)}%,"
+        f"PE:{round(pe, 1)})"
+    )
+    tag_str = " | ".join(tags)
+
+    logger.info(f"[{code}] {stock_name} 命中 → {tag_str}")
+
+    return True, tag_str, {
+        "name":    stock_name,
+        "code":    code,
+        "price":   df["close"].iloc[-1],
+        "pct":     df["pctChg"].iloc[-1],
+        "tag":     tag_str,
+        "ai_desc": ai_desc,
+    }
+
+# ── 步骤 4：AI 深度点评 ──────────────────────────────────
+def get_ai_commentary(context: str, api_key: str) -> dict:
+    if not context:
+        return {}
+
+    prompt = (
+        "你是一个专业的A股策略分析师。我会给你提供一组量化筛选出的异动个股数据（包含涨幅、换手、PE）。\n"
+        "请根据这些真实数据，分析该板块当前的资金偏好、估值安全度及后续趋势。150字左右。\n"
+        "必须返回 JSON 格式，Key 为板块名，内容为点评。\n\n"
+        + context
+    )
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": "openrouter/free",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "max_tokens": CONFIG["ai_max_tokens"],
+    }
+
+    for attempt in range(1, 4):  # 最多重试3次
+        try:
+            r = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=CONFIG["ai_timeout"],
+            )
+            r.raise_for_status()
+            res_text = r.json()["choices"][0]["message"]["content"].strip()
+            clean = re.sub(r"^```json\s*|```$", "", res_text, flags=re.MULTILINE).strip()
+            return json.loads(re.search(r"\{.*\}", clean, re.DOTALL).group(0))
+        except Exception as e:
+            logger.warning(f"AI 接口第 {attempt} 次调用失败: {e}")
+            if attempt < 3:
+                time.sleep(2 ** attempt)  # 指数退避：2s, 4s
+
+    logger.error("AI 接口连续失败，跳过点评")
+    return {}
+
+# ── 步骤 5：串行扫描单个板块 ─────────────────────────────
+def scan_pool(pool_name: str, prefixes: list) -> list:
+    triggered = []
+
+    for prefix in prefixes:
+        codes    = get_stock_list(prefix)
+        snapshot = fetch_realtime_sina(codes)
+        if snapshot.empty:
+            continue
+
+        candidates = (
+            snapshot[snapshot["amount"] >= CONFIG["min_amount"]]
+            .sort_values("amount", ascending=False)
+            .head(CONFIG["top_n_candidates"])
+        )
+        logger.info(f"[{pool_name}/{prefix}] 候选股 {len(candidates)} 支，开始串行分析...")
+
+        for _, row in candidates.iterrows():
+            is_hit, tag, data = analyze_stock_strategies(row["code"], row["name"])
+            if is_hit:
+                triggered.append(data)
+                if len(triggered) >= CONFIG["max_hits_per_pool"]:
+                    break
+
+    logger.info(f"[{pool_name}] 扫描完成，命中 {len(triggered)} 支")
+    return triggered
+
+# ── 步骤 6：主逻辑 ────────────────────────────────────────
+def build_message(collected_data: dict, ai_comments: dict) -> str:
+    msg = f"**🎯 硬核量化监控 (共振过滤版)**\n> 扫描时间：{get_current_time()}\n\n"
+
+    if not collected_data:
+        msg += "> 💤 今日暂无满足 PE 10-30 & 多周期共振的标的。"
+        return msg
+
+    for sec, stocks in collected_data.items():
+        msg += f"### 📊 {sec}\n"
+        comment = ai_comments.get(sec, "个股技术形态呈现多周期共振向上，估值处于安全区间。")
+        msg += f"> 🤖 **AI 战法研判**：\n> <font color=\"comment\">{comment}</font>\n\n"
+        for s in stocks:
+            color = "warning" if float(s["pct"]) > 0 else "info"
+            msg += (
+                f"- **{s['name']}** ({s['code']}) | "
+                f"{s['price']} (<font color='{color}'>{s['pct']}%</font>)\n"
+                f"  💡 信号：**<font color=\"warning\">{s['tag']}</font>**\n"
+            )
+        msg += "\n---\n"
+
+    return msg.strip()
+
+def main():
+    webhook_url = os.environ.get("WECHAT_WEBHOOK")
+    api_key     = os.environ.get("OPENROUTER_API_KEY")
+
+    if not webhook_url:
+        logger.error("环境变量 WECHAT_WEBHOOK 未设置，退出")
+        return
+
+    # 主进程登录一次，用于 get_stock_list
+    bs.login()
+    collected_data: dict = {}
+    ai_context: str = ""
+
+    try:
+        for pool_name, prefixes in SCAN_POOLS.items():
+            triggered = scan_pool(pool_name, prefixes)
+            if triggered:
+                collected_data[pool_name] = triggered
+                ai_context += f"\n【{pool_name}】:" + "; ".join(s["ai_desc"] for s in triggered)
+    finally:
+        bs.logout()
+
+    ai_comments = get_ai_commentary(ai_context, api_key) if api_key else {}
+    msg = build_message(collected_data, ai_comments)
+
+    try:
+        resp = requests.post(
+            webhook_url,
+            json={"msgtype": "markdown", "markdown": {"content": msg}},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        logger.info("消息推送成功")
+    except Exception as e:
+        logger.error(f"消息推送失败: {e}")
+
+if __name__ == "__main__":
+    main()
