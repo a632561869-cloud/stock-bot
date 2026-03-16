@@ -2,7 +2,6 @@ name: Stock Monitor Bot
 
 on:
   # 移除了 push: branches: [ "main" ]，防止每次提交代码都触发推送
-  
   schedule:
     # 对应北京时间 (UTC+8):
     # 02:15 UTC -> 10:15 (早盘确认，换手率初步释放)
@@ -36,7 +35,7 @@ jobs:
     - name: 安装依赖包
       run: |
         python -m pip install --upgrade pip
-        pip install requests pandas baostock 
+        pip install requests pandas baostock
 
     - name: 运行监控脚本
       env:
