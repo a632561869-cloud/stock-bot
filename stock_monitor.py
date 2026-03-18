@@ -163,7 +163,7 @@ def get_ai_commentary(context: str, api_key: str) -> str:
     payload = {"model": "openrouter/free", "messages": [{"role": "user", "content": prompt}], "temperature": 0.2}
     
     try:
-        r = requests.post("[https://openrouter.ai/api/v1/chat/completions](https://openrouter.ai/api/v1/chat/completions)", headers=headers, json=payload, timeout=50)
+        r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=50)
         
         if r.status_code != 200:
             print(f"❌ [AI] 接口报错: HTTP {r.status_code}\n{r.text}")
