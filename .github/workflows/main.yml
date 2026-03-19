@@ -1,11 +1,6 @@
 name: Stock Monitor Bot
 
 on:
-  schedule:
-    # - cron: '17 2 * * 1-5'  # 10:17 北京时间
-    # - cron: '4 3 * * 1-5'   # 11:04 北京时间
-    # - cron: '13 6 * * 1-5'  # 14:13 北京时间
-    # - cron: '18 7 * * 1-5'  # 15:18 北京时间
   workflow_dispatch:
 
 concurrency:
